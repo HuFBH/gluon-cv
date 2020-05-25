@@ -17,6 +17,11 @@ class CitySegmentation(SegmentationDataset):
     # pylint: disable=abstract-method
     BASE_DIR = 'cityscapes'
     NUM_CLASS = 19
+    CLASSES = ("road", "sidewalk", "building", "wall", "fence",
+               "pole", "traffic light", "traffic sign", "vegetation",
+               "terrain", "sky", "person", "rider", "car", "truck",
+               "bus", "train", "motorcycle", "bicyle")
+
     def __init__(self, root=os.path.expanduser('~/.mxnet/datasets/citys'), split='train',
                  mode=None, transform=None, **kwargs):
         super(CitySegmentation, self).__init__(
@@ -48,6 +53,7 @@ class CitySegmentation(SegmentationDataset):
     def __getitem__(self, index):
         img = Image.open(self.images[index]).convert('RGB')
         if self.mode == 'test':
+            img = self._img_transform(img)
             if self.transform is not None:
                 img = self.transform(img)
             return img, os.path.basename(self.images[index])
@@ -79,6 +85,7 @@ class CitySegmentation(SegmentationDataset):
 
 def _get_city_pairs(folder, split='train'):
     def get_path_pairs(img_folder, mask_folder):
+        """get image and mask path pair"""
         img_paths = []
         mask_paths = []
         for root, _, files in os.walk(img_folder):

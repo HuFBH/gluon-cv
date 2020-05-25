@@ -3,6 +3,7 @@ import argparse, time, logging, os, sys, math
 import numpy as np
 import mxnet as mx
 import gluoncv as gcv
+gcv.utils.check_version('0.6.0')
 from mxnet import gluon, nd, init, context
 from mxnet import autograd as ag
 from mxnet.gluon import nn
@@ -11,16 +12,15 @@ from mxboard import SummaryWriter
 from mxnet.contrib import amp
 
 from gluoncv.data.transforms import video
-from gluoncv.data import ucf101, kinetics400
+from gluoncv.data import UCF101, Kinetics400, SomethingSomethingV2, HMDB51, VideoClsCustom
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs, LRSequential, LRScheduler, split_and_load
-from gluoncv.data.dataloader import tsn_mp_batchify_fn
-from gluoncv.data.sampler import SplitSampler
+from gluoncv.data.sampler import SplitSampler, ShuffleSplitSampler
 
 # CLI
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train a model for action recognition.')
-    parser.add_argument('--dataset', type=str, default='ucf101', choices=['ucf101', 'kinetics400'],
+    parser = argparse.ArgumentParser(description='Train a model for video action recognition.')
+    parser.add_argument('--dataset', type=str, default='ucf101', choices=['ucf101', 'kinetics400', 'somethingsomethingv2', 'hmdb51', 'custom'],
                         help='which dataset to use.')
     parser.add_argument('--data-dir', type=str, default='~/.mxnet/datasets/ucf101/rawframes',
                         help='training (and validation) pictures to use.')
@@ -70,6 +70,8 @@ def parse_args():
                         help='Crop ratio during validation. default is 0.875')
     parser.add_argument('--use-pretrained', action='store_true',
                         help='enable using pretrained model from gluon.')
+    parser.add_argument('--hashtag', type=str, default='',
+                        help='hashtag for pretrained models.')
     parser.add_argument('--use_se', action='store_true',
                         help='use SE layers or not in resnext. default is false.')
     parser.add_argument('--mixup', action='store_true',
@@ -124,6 +126,8 @@ def parse_args():
                         help='clip gradient to a certain threshold. Set the value to be larger than zero to enable gradient clipping.')
     parser.add_argument('--partial-bn', action='store_true',
                         help='whether to freeze bn layers except the first layer.')
+    parser.add_argument('--freeze-bn', action='store_true',
+                        help='whether to freeze all the bn layers.')
     parser.add_argument('--num-classes', type=int, default=101,
                         help='number of classes.')
     parser.add_argument('--scale-ratios', type=str, default='1.0, 0.875, 0.75, 0.66',
@@ -134,6 +138,24 @@ def parse_args():
                         help='set number of workers to prefetch data batch, default is 2 in MXNet.')
     parser.add_argument('--kvstore', type=str, default=None,
                         help='KVStore type. Supports local, device, dist_sync_device, dist_async_device')
+    parser.add_argument('--input-5d', action='store_true',
+                        help='the input is 4d or 5d tensor. 5d is for 3D CNN models.')
+    parser.add_argument('--video-loader', action='store_true',
+                        help='if set to True, read videos directly instead of reading frames.')
+    parser.add_argument('--use-decord', action='store_true',
+                        help='if set to True, use Decord video loader to load data. Otherwise use mmcv video loader.')
+    parser.add_argument('--accumulate', type=int, default=1,
+                        help='new step to accumulate gradient. If >1, the batch size is enlarged.')
+    parser.add_argument('--slowfast', action='store_true',
+                        help='if set to True, use data loader designed for SlowFast network.')
+    parser.add_argument('--slow-temporal-stride', type=int, default=16,
+                        help='the temporal stride for sparse sampling of video frames for slow branch in SlowFast network.')
+    parser.add_argument('--fast-temporal-stride', type=int, default=2,
+                        help='the temporal stride for sparse sampling of video frames for fast branch in SlowFast network.')
+    parser.add_argument('--num-crop', type=int, default=1,
+                        help='number of crops for each image. default is 1')
+    parser.add_argument('--data-aug', type=str, default='v1',
+                        help='different types of data augmentation pipelines. Supports v1, v2, v3 and v4.')
     opt = parser.parse_args()
     return opt
 
@@ -142,62 +164,107 @@ def get_data_loader(opt, batch_size, num_workers, logger, kvstore=None):
     val_data_dir = opt.val_data_dir
     scale_ratios = [float(i) for i in opt.scale_ratios.split(',')]
     input_size = opt.input_size
+    default_mean = [0.485, 0.456, 0.406]
+    default_std = [0.229, 0.224, 0.225]
 
     def batch_fn(batch, ctx):
-        if opt.num_segments > 1:
-            data = split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False, multiplier=opt.num_segments)
-        else:
-            data = split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False)
+        data = split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False)
         label = split_and_load(batch[1], ctx_list=ctx, batch_axis=0, even_split=False)
         return data, label
 
-    transform_train = transforms.Compose([
-        video.VideoMultiScaleCrop(size=(input_size, input_size), scale_ratios=scale_ratios),
-        video.VideoRandomHorizontalFlip(),
-        video.VideoToTensor(),
-        video.VideoNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-    transform_test = transforms.Compose([
-        video.VideoCenterCrop(size=input_size),
-        video.VideoToTensor(),
-        video.VideoNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    if opt.data_aug == 'v1':
+        # GluonCV style, not keeping aspect ratio, multi-scale crop
+        transform_train = video.VideoGroupTrainTransform(size=(input_size, input_size), scale_ratios=scale_ratios,
+                                                         mean=default_mean, std=default_std)
+        transform_test = video.VideoGroupValTransform(size=input_size,
+                                                      mean=default_mean, std=default_std)
+    elif opt.data_aug == 'v2':
+        # GluonCV style, keeping aspect ratio, multi-scale crop, same as mmaction style
+        transform_train = video.VideoGroupTrainTransformV2(size=(input_size, input_size), short_side=opt.new_height, scale_ratios=scale_ratios,
+                                                         mean=default_mean, std=default_std)
+        transform_test = video.VideoGroupValTransformV2(crop_size=(input_size, input_size), short_side=opt.new_height,
+                                                        mean=default_mean, std=default_std)
+    elif opt.data_aug == 'v3':
+        # PySlowFast style, keeping aspect ratio, random short side scale jittering
+        transform_train = video.VideoGroupTrainTransformV3(crop_size=(input_size, input_size), min_size=opt.new_height, max_size=opt.new_width,
+                                                           mean=default_mean, std=default_std)
+        transform_test = video.VideoGroupValTransformV2(crop_size=(input_size, input_size), short_side=opt.new_height,
+                                                        mean=default_mean, std=default_std)
+    elif opt.data_aug == 'v4':
+        # mmaction style, keeping aspect ratio, random crop and resize, only for SlowFast family models, similar to 'v3'
+        transform_train = video.VideoGroupTrainTransformV4(size=(input_size, input_size),
+                                                           mean=default_mean, std=default_std)
+        transform_test = video.VideoGroupValTransformV2(crop_size=(input_size, input_size), short_side=opt.new_height,
+                                                        mean=default_mean, std=default_std)
+    else:
+        logger.info('Data augmentation %s is not supported yet.' % (opt.data_aug))
 
     if opt.dataset == 'kinetics400':
-        train_dataset = kinetics400.classification.Kinetics400(setting=opt.train_list, root=data_dir, train=True,
-                                                     new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
-                                                     target_width=input_size, target_height=input_size,
-                                                     num_segments=opt.num_segments, transform=transform_train)
-        val_dataset = kinetics400.classification.Kinetics400(setting=opt.val_list, root=val_data_dir, train=False,
-                                                   new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
-                                                   target_width=input_size, target_height=input_size,
-                                                   num_segments=opt.num_segments, transform=transform_test)
+        train_dataset = Kinetics400(setting=opt.train_list, root=data_dir, train=True,
+                                    new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                    target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                    slowfast=opt.slowfast, slow_temporal_stride=opt.slow_temporal_stride, fast_temporal_stride=opt.fast_temporal_stride,
+                                    data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_train)
+        val_dataset = Kinetics400(setting=opt.val_list, root=val_data_dir, train=False,
+                                  new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                  target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                  slowfast=opt.slowfast, slow_temporal_stride=opt.slow_temporal_stride, fast_temporal_stride=opt.fast_temporal_stride,
+                                  data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_test)
     elif opt.dataset == 'ucf101':
-        train_dataset = ucf101.classification.UCF101(setting=opt.train_list, root=data_dir, train=True,
-                                                     new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length,
-                                                     target_width=input_size, target_height=input_size,
-                                                     num_segments=opt.num_segments, transform=transform_train)
-        val_dataset = ucf101.classification.UCF101(setting=opt.val_list, root=data_dir, train=False,
-                                                   new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length,
-                                                   target_width=input_size, target_height=input_size,
-                                                   num_segments=opt.num_segments, transform=transform_test)
+        train_dataset = UCF101(setting=opt.train_list, root=data_dir, train=True,
+                               new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length,
+                               target_width=input_size, target_height=input_size,
+                               data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_train)
+        val_dataset = UCF101(setting=opt.val_list, root=data_dir, train=False,
+                             new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length,
+                             target_width=input_size, target_height=input_size,
+                             data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_test)
+    elif opt.dataset == 'somethingsomethingv2':
+        train_dataset = SomethingSomethingV2(setting=opt.train_list, root=data_dir, train=True,
+                                             new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                             target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                             data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_train)
+        val_dataset = SomethingSomethingV2(setting=opt.val_list, root=data_dir, train=False,
+                                           new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                           target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                           data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_test)
+    elif opt.dataset == 'hmdb51':
+        train_dataset = HMDB51(setting=opt.train_list, root=data_dir, train=True,
+                               new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                               target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                               data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_train)
+        val_dataset = HMDB51(setting=opt.val_list, root=data_dir, train=False,
+                             new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                             target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                             data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_test)
+    elif opt.dataset == 'custom':
+        train_dataset = VideoClsCustom(setting=opt.train_list, root=data_dir, train=True,
+                                       new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                       target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                       slowfast=opt.slowfast, slow_temporal_stride=opt.slow_temporal_stride, fast_temporal_stride=opt.fast_temporal_stride,
+                                       data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_train)
+        val_dataset = VideoClsCustom(setting=opt.val_list, root=val_data_dir, train=False,
+                                     new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                     target_width=input_size, target_height=input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                     slowfast=opt.slowfast, slow_temporal_stride=opt.slow_temporal_stride, fast_temporal_stride=opt.fast_temporal_stride,
+                                     data_aug=opt.data_aug, num_segments=opt.num_segments, transform=transform_test)
     else:
         logger.info('Dataset %s is not supported yet.' % (opt.dataset))
 
     logger.info('Load %d training samples and %d validation samples.' % (len(train_dataset), len(val_dataset)))
 
-    if opt.num_segments > 1:
-        train_data = gluon.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, batchify_fn=tsn_mp_batchify_fn, last_batch='rollover')
-        val_data = gluon.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, batchify_fn=tsn_mp_batchify_fn, last_batch='keep')
+    if kvstore is not None:
+        train_data = gluon.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers,
+                                           sampler=ShuffleSplitSampler(len(train_dataset), num_parts=kvstore.num_workers, part_index=kvstore.rank),
+                                           prefetch=int(opt.prefetch_ratio * num_workers), last_batch='rollover')
+        val_data = gluon.data.DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers,
+                                         sampler=ShuffleSplitSampler(len(val_dataset), num_parts=kvstore.num_workers, part_index=kvstore.rank),
+                                         prefetch=int(opt.prefetch_ratio * num_workers), last_batch='discard')
     else:
-        if kvstore is not None:
-            train_data = gluon.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, prefetch=int(opt.prefetch_ratio * num_workers),
-                                           sampler=SplitSampler(len(train_dataset), num_parts=kvstore.num_workers, part_index=kvstore.rank), last_batch='rollover')
-            val_data = gluon.data.DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers, prefetch=int(opt.prefetch_ratio * num_workers),
-                                           sampler=SplitSampler(len(val_dataset), num_parts=kvstore.num_workers, part_index=kvstore.rank), last_batch='keep')
-        else:
-            train_data = gluon.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, prefetch=int(opt.prefetch_ratio * num_workers), last_batch='rollover')
-            val_data = gluon.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, prefetch=int(opt.prefetch_ratio * num_workers), last_batch='keep')
+        train_data = gluon.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                                           prefetch=int(opt.prefetch_ratio * num_workers), last_batch='rollover')
+        val_data = gluon.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                                         prefetch=int(opt.prefetch_ratio * num_workers), last_batch='discard')
 
     return train_data, val_data, batch_fn
 
@@ -214,7 +281,7 @@ def main():
     logger.addHandler(streamhandler)
     logger.info(opt)
 
-    sw = SummaryWriter(logdir=opt.save_dir, flush_secs=5)
+    sw = SummaryWriter(logdir=opt.save_dir, flush_secs=5, verbose=False)
 
     if opt.kvstore is not None:
         kv = mx.kvstore.create(opt.kvstore)
@@ -239,7 +306,11 @@ def main():
         lr_decay_epoch = [int(i) for i in opt.lr_decay_epoch.split(',')]
     lr_decay_epoch = [e - opt.warmup_epochs for e in lr_decay_epoch]
 
-    optimizer = 'sgd'
+    if opt.slowfast:
+        optimizer = 'nag'
+    else:
+        optimizer = 'sgd'
+
     if opt.clip_grad > 0:
         optimizer_params = {'learning_rate': opt.lr, 'wd': opt.wd, 'momentum': opt.momentum, 'clip_gradient': opt.clip_grad}
     else:
@@ -249,19 +320,35 @@ def main():
         optimizer_params['multi_precision'] = True
 
     model_name = opt.model
+    if opt.use_pretrained and len(opt.hashtag) > 0:
+        opt.use_pretrained = opt.hashtag
     net = get_model(name=model_name, nclass=classes, pretrained=opt.use_pretrained,
-                    tsn=opt.use_tsn, num_segments=opt.num_segments, partial_bn=opt.partial_bn)
+                    use_tsn=opt.use_tsn, num_segments=opt.num_segments, partial_bn=opt.partial_bn,
+                    bn_frozen=opt.freeze_bn)
     net.cast(opt.dtype)
     net.collect_params().reset_ctx(context)
     logger.info(net)
 
     if opt.resume_params is not '':
         net.load_parameters(opt.resume_params, ctx=context)
+        print('Continue training from model %s.' % (opt.resume_params))
 
     if opt.kvstore is not None:
         train_data, val_data, batch_fn = get_data_loader(opt, batch_size, num_workers, logger, kv)
     else:
         train_data, val_data, batch_fn = get_data_loader(opt, batch_size, num_workers, logger)
+
+    num_batches = len(train_data) // opt.accumulate
+    lr_scheduler = LRSequential([
+        LRScheduler('linear', base_lr=opt.warmup_lr, target_lr=opt.lr,
+                    nepochs=opt.warmup_epochs, iters_per_epoch=num_batches),
+        LRScheduler(opt.lr_mode, base_lr=opt.lr, target_lr=0,
+                    nepochs=opt.num_epochs - opt.warmup_epochs,
+                    iters_per_epoch=num_batches,
+                    step_epoch=lr_decay_epoch,
+                    step_factor=lr_decay, power=2)
+    ])
+    optimizer_params['lr_scheduler'] = lr_scheduler
 
     train_metric = mx.metric.Accuracy()
     acc_top1 = mx.metric.Accuracy()
@@ -270,30 +357,48 @@ def main():
     def test(ctx, val_data, kvstore=None):
         acc_top1.reset()
         acc_top5.reset()
+        L = gluon.loss.SoftmaxCrossEntropyLoss()
         num_test_iter = len(val_data)
+        val_loss_epoch = 0
         for i, batch in enumerate(val_data):
             data, label = batch_fn(batch, ctx)
-            outputs = [net(X.astype(opt.dtype, copy=False)) for X in data]
+            outputs = []
+            for _, X in enumerate(data):
+                X = X.reshape((-1,) + X.shape[2:])
+                pred = net(X.astype(opt.dtype, copy=False))
+                outputs.append(pred)
+
+            loss = [L(yhat, y.astype(opt.dtype, copy=False)) for yhat, y in zip(outputs, label)]
+
             acc_top1.update(label, outputs)
             acc_top5.update(label, outputs)
 
+            val_loss_epoch += sum([l.mean().asscalar() for l in loss]) / len(loss)
+
             if opt.log_interval and not (i+1) % opt.log_interval:
-                logger.info('Batch [%04d]/[%04d]: evaluated' % (i, num_test_iter))
+                _, top1 = acc_top1.get()
+                _, top5 = acc_top5.get()
+                logger.info('Batch [%04d]/[%04d]: acc-top1=%f acc-top5=%f' % (i, num_test_iter, top1*100, top5*100))
 
         _, top1 = acc_top1.get()
         _, top5 = acc_top5.get()
+        val_loss = val_loss_epoch / num_test_iter
 
         if kvstore is not None:
             top1_nd = nd.zeros(1)
             top5_nd = nd.zeros(1)
+            val_loss_nd = nd.zeros(1)
             kvstore.push(111111, nd.array(np.array([top1])))
             kvstore.pull(111111, out=top1_nd)
             kvstore.push(555555, nd.array(np.array([top5])))
             kvstore.pull(555555, out=top5_nd)
+            kvstore.push(999999, nd.array(np.array([val_loss])))
+            kvstore.pull(999999, out=val_loss_nd)
             top1 = top1_nd.asnumpy() / kvstore.num_workers
             top5 = top5_nd.asnumpy() / kvstore.num_workers
+            val_loss = val_loss_nd.asnumpy() / kvstore.num_workers
 
-        return (top1, top5)
+        return (top1, top5, val_loss)
 
     def train(ctx):
         if isinstance(ctx, mx.Context):
@@ -307,9 +412,17 @@ def main():
             train_patterns = None
             if 'inceptionv3' in opt.model:
                 train_patterns = '.*weight|.*bias|inception30_batchnorm0_gamma|inception30_batchnorm0_beta|inception30_batchnorm0_running_mean|inception30_batchnorm0_running_var'
+            elif 'inceptionv1' in opt.model:
+                train_patterns = '.*weight|.*bias|googlenet0_batchnorm0_gamma|googlenet0_batchnorm0_beta|googlenet0_batchnorm0_running_mean|googlenet0_batchnorm0_running_var'
             else:
                 logger.info('Current model does not support partial batch normalization.')
 
+            if opt.kvstore is not None:
+                trainer = gluon.Trainer(net.collect_params(train_patterns), optimizer, optimizer_params, kvstore=kv, update_on_kvstore=False)
+            else:
+                trainer = gluon.Trainer(net.collect_params(train_patterns), optimizer, optimizer_params, update_on_kvstore=False)
+        elif opt.freeze_bn:
+            train_patterns = '.*weight|.*bias'
             if opt.kvstore is not None:
                 trainer = gluon.Trainer(net.collect_params(train_patterns), optimizer, optimizer_params, kvstore=kv, update_on_kvstore=False)
             else:
@@ -319,6 +432,11 @@ def main():
                 trainer = gluon.Trainer(net.collect_params(), optimizer, optimizer_params, kvstore=kv, update_on_kvstore=False)
             else:
                 trainer = gluon.Trainer(net.collect_params(), optimizer, optimizer_params, update_on_kvstore=False)
+
+        if opt.accumulate > 1:
+            params = [p for p in net.collect_params().values() if p.grad_req != 'null']
+            for p in params:
+                p.grad_req = 'add'
 
         if opt.resume_states is not '':
             trainer.load_states(opt.resume_states)
@@ -336,16 +454,18 @@ def main():
             train_metric.reset()
             btic = time.time()
             num_train_iter = len(train_data)
-
-            if epoch == lr_decay_epoch[lr_decay_count]:
-                trainer.set_learning_rate(trainer.learning_rate * lr_decay)
-                lr_decay_count += 1
+            train_loss_epoch = 0
+            train_loss_iter = 0
 
             for i, batch in enumerate(train_data):
                 data, label = batch_fn(batch, ctx)
 
                 with ag.record():
-                    outputs = [net(X.astype(opt.dtype, copy=False)) for X in data]
+                    outputs = []
+                    for _, X in enumerate(data):
+                        X = X.reshape((-1,) + X.shape[2:])
+                        pred = net(X.astype(opt.dtype, copy=False))
+                        outputs.append(pred)
                     loss = [L(yhat, y.astype(opt.dtype, copy=False)) for yhat, y in zip(outputs, label)]
 
                     if opt.use_amp:
@@ -354,18 +474,32 @@ def main():
                     else:
                         ag.backward(loss)
 
-                if opt.kvstore is not None:
-                    trainer.step(batch_size * kv.num_workers)
+                if opt.accumulate > 1:
+                    if (i + 1) % opt.accumulate == 0:
+                        if opt.kvstore is not None:
+                            trainer.step(batch_size * kv.num_workers * opt.accumulate)
+                        else:
+                            trainer.step(batch_size * opt.accumulate)
+                            net.collect_params().zero_grad()
                 else:
-                    trainer.step(batch_size)
+                    if opt.kvstore is not None:
+                        trainer.step(batch_size * kv.num_workers)
+                    else:
+                        trainer.step(batch_size)
 
                 train_metric.update(label, outputs)
+                train_loss_iter = sum([l.mean().asscalar() for l in loss]) / len(loss)
+                train_loss_epoch += train_loss_iter
+
+                train_metric_name, train_metric_score = train_metric.get()
+                sw.add_scalar(tag='train_acc_top1_iter', value=train_metric_score*100, global_step=epoch * num_train_iter + i)
+                sw.add_scalar(tag='train_loss_iter', value=train_loss_iter, global_step=epoch * num_train_iter + i)
+                sw.add_scalar(tag='learning_rate_iter', value=trainer.learning_rate, global_step=epoch * num_train_iter + i)
 
                 if opt.log_interval and not (i+1) % opt.log_interval:
-                    train_metric_name, train_metric_score = train_metric.get()
-                    logger.info('Epoch[%03d] Batch [%04d]/[%04d]\tSpeed: %f samples/sec\t%s=%f\tlr=%f' % (
+                    logger.info('Epoch[%03d] Batch [%04d]/[%04d]\tSpeed: %f samples/sec\t %s=%f\t loss=%f\t lr=%f' % (
                                 epoch, i, num_train_iter, batch_size*opt.log_interval/(time.time()-btic),
-                                train_metric_name, train_metric_score*100, trainer.learning_rate))
+                                train_metric_name, train_metric_score*100, train_loss_epoch/(i+1), trainer.learning_rate))
                     btic = time.time()
 
             train_metric_name, train_metric_score = train_metric.get()
@@ -375,39 +509,32 @@ def main():
             if opt.kvstore is not None and epoch == opt.resume_epoch:
                 kv.init(111111, nd.zeros(1))
                 kv.init(555555, nd.zeros(1))
+                kv.init(999999, nd.zeros(1))
 
             if opt.kvstore is not None:
-                acc_top1_val, acc_top5_val = test(ctx, val_data, kv)
+                acc_top1_val, acc_top5_val, loss_val = test(ctx, val_data, kv)
             else:
-                acc_top1_val, acc_top5_val = test(ctx, val_data)
+                acc_top1_val, acc_top5_val, loss_val = test(ctx, val_data)
 
-            logger.info('[Epoch %03d] training: %s=%f' % (epoch, train_metric_name, train_metric_score*100))
+            logger.info('[Epoch %03d] training: %s=%f\t loss=%f' % (epoch, train_metric_name, train_metric_score*100, train_loss_epoch/num_train_iter))
             logger.info('[Epoch %03d] speed: %d samples/sec\ttime cost: %f' % (epoch, throughput, time.time()-tic))
-            logger.info('[Epoch %03d] validation: acc-top1=%f acc-top5=%f' % (epoch, acc_top1_val*100, acc_top5_val*100))
+            logger.info('[Epoch %03d] validation: acc-top1=%f acc-top5=%f loss=%f' % (epoch, acc_top1_val*100, acc_top5_val*100, loss_val))
 
-            sw.add_scalar(tag='train_acc', value=train_metric_score*100, global_step=epoch)
-            sw.add_scalar(tag='valid_acc', value=acc_top1_val*100, global_step=epoch)
+            sw.add_scalar(tag='train_loss_epoch', value=train_loss_epoch/num_train_iter, global_step=epoch)
+            sw.add_scalar(tag='val_loss_epoch', value=loss_val, global_step=epoch)
+            sw.add_scalar(tag='val_acc_top1_epoch', value=acc_top1_val*100, global_step=epoch)
 
             if acc_top1_val > best_val_score:
                 best_val_score = acc_top1_val
-                if opt.use_tsn:
-                    net.basenet.save_parameters('%s/%.4f-%s-%s-%03d-best.params'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
-                else:
-                    net.save_parameters('%s/%.4f-%s-%s-%03d-best.params'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
+                net.save_parameters('%s/%.4f-%s-%s-%03d-best.params'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
                 trainer.save_states('%s/%.4f-%s-%s-%03d-best.states'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
-
-            if opt.save_frequency and opt.save_dir and (epoch + 1) % opt.save_frequency == 0:
-                if opt.use_tsn:
-                    net.basenet.save_parameters('%s/%s-%s-%03d.params'%(opt.save_dir, opt.dataset, model_name, epoch))
-                else:
+            else:
+                if opt.save_frequency and opt.save_dir and (epoch + 1) % opt.save_frequency == 0:
                     net.save_parameters('%s/%s-%s-%03d.params'%(opt.save_dir, opt.dataset, model_name, epoch))
-                trainer.save_states('%s/%-%s-%03d.states'%(opt.save_dir, opt.dataset, model_name, epoch))
+                    trainer.save_states('%s/%s-%s-%03d.states'%(opt.save_dir, opt.dataset, model_name, epoch))
 
         # save the last model
-        if opt.use_tsn:
-            net.basenet.save_parameters('%s/%s-%s-%03d.params'%(opt.save_dir, opt.dataset, model_name, opt.num_epochs-1))
-        else:
-            net.save_parameters('%s/%s-%s-%03d.params'%(opt.save_dir, opt.dataset, model_name, opt.num_epochs-1))
+        net.save_parameters('%s/%s-%s-%03d.params'%(opt.save_dir, opt.dataset, model_name, opt.num_epochs-1))
         trainer.save_states('%s/%s-%s-%03d.states'%(opt.save_dir, opt.dataset, model_name, opt.num_epochs-1))
 
     if opt.mode == 'hybrid':
@@ -415,7 +542,6 @@ def main():
 
     train(context)
     sw.close()
-
 
 if __name__ == '__main__':
     main()

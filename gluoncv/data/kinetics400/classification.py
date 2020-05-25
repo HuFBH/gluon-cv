@@ -1,193 +1,114 @@
 # pylint: disable=line-too-long,too-many-lines,missing-docstring
-"""Kinetics400 action classification dataset."""
+"""Kinetics400 video action recognition dataset.
+Code adapted from https://github.com/open-mmlab/mmaction and
+https://github.com/bryanyzhu/two-stream-pytorch"""
 import os
-import random
-import numpy as np
-from mxnet import nd
-from mxnet.gluon.data import dataset
+from ..video_custom import VideoClsCustom
 
 __all__ = ['Kinetics400']
 
-class Kinetics400(dataset.Dataset):
-    """Load the Kinetics400 action recognition dataset.
+class Kinetics400(VideoClsCustom):
+    """Load the Kinetics400 video action recognition dataset.
 
     Refer to :doc:`../build/examples_datasets/kinetics400` for the description of
     this dataset and how to prepare it.
 
     Parameters
     ----------
-    root : str, default '~/.mxnet/datasets/kinetics400'
-        Path to the folder stored the dataset.
-    setting : str, required
-        Config file of the prepared dataset.
-    train : bool, default True
+    root : str, required. Default '~/.mxnet/datasets/kinetics400/rawframes_train'.
+        Path to the root folder storing the dataset.
+    setting : str, required.
+        A text file describing the dataset, each line per video sample.
+        There are three items in each line: (1) video path; (2) video length and (3) video label.
+    train : bool, default True.
         Whether to load the training or validation set.
-    test_mode : bool, default False
-        Whether to perform evaluation on the test set
-    name_pattern : str, default None
+    test_mode : bool, default False.
+        Whether to perform evaluation on the test set.
+        Usually there is three-crop or ten-crop evaluation strategy involved.
+    name_pattern : str, default None.
         The naming pattern of the decoded video frames.
-        For example, img_00012.jpg
-    is_color : bool, default True
-        Whether the loaded image is color or grayscale
-    modality : str, default 'rgb'
+        For example, img_00012.jpg.
+    video_ext : str, default 'mp4'.
+        If video_loader is set to True, please specify the video format accordinly.
+    is_color : bool, default True.
+        Whether the loaded image is color or grayscale.
+    modality : str, default 'rgb'.
         Input modalities, we support only rgb video frames for now.
         Will add support for rgb difference image and optical flow image later.
-    num_segments : int, default 1
+    num_segments : int, default 1.
         Number of segments to evenly divide the video into clips.
         A useful technique to obtain global video-level information.
-        Limin Wang, etal, Temporal Segment Networks: Towards Good Practices for Deep Action Recognition, ECCV 2016
-    new_length : int, default 1
+        Limin Wang, etal, Temporal Segment Networks: Towards Good Practices for Deep Action Recognition, ECCV 2016.
+    num_crop : int, default 1.
+        Number of crops for each image. default is 1.
+        Common choices are three crops and ten crops during evaluation.
+    new_length : int, default 1.
         The length of input video clip. Default is a single image, but it can be multiple video frames.
         For example, new_length=16 means we will extract a video clip of consecutive 16 frames.
-    new_width : int, default 340
+    new_step : int, default 1.
+        Temporal sampling rate. For example, new_step=1 means we will extract a video clip of consecutive frames.
+        new_step=2 means we will extract a video clip of every other frame.
+    new_width : int, default 340.
         Scale the width of loaded image to 'new_width' for later multiscale cropping and resizing.
-    new_height : int, default 256
+    new_height : int, default 256.
         Scale the height of loaded image to 'new_height' for later multiscale cropping and resizing.
-    target_width : int, default 224
+    target_width : int, default 224.
         Scale the width of transformed image to the same 'target_width' for batch forwarding.
-    target_height : int, default 224
+    target_height : int, default 224.
         Scale the height of transformed image to the same 'target_height' for batch forwarding.
-    transform : function, default None
+    temporal_jitter : bool, default False.
+        Whether to temporally jitter if new_step > 1.
+    video_loader : bool, default False.
+        Whether to use video loader to load data.
+    use_decord : bool, default True.
+        Whether to use Decord video loader to load data. Otherwise use mmcv video loader.
+    transform : function, default None.
         A function that takes data and label and transforms them.
+    slowfast : bool, default False.
+        If set to True, use data loader designed for SlowFast network.
+        Christoph Feichtenhofer, etal, SlowFast Networks for Video Recognition, ICCV 2019.
+    slow_temporal_stride : int, default 16.
+        The temporal stride for sparse sampling of video frames in slow branch of a SlowFast network.
+    fast_temporal_stride : int, default 2.
+        The temporal stride for sparse sampling of video frames in fast branch of a SlowFast network.
+    data_aug : str, default 'v1'.
+        Different types of data augmentation pipelines. Supports v1, v2, v3 and v4.
+    lazy_init : bool, default False.
+        If set to True, build a dataset instance without loading any dataset.
     """
     def __init__(self,
-                 setting=os.path.expanduser('~/.mxnet/datasets/kinetics400/kinetics400_train_list_rawframes.txt'),
                  root=os.path.expanduser('~/.mxnet/datasets/kinetics400/rawframes_train'),
+                 setting=os.path.expanduser('~/.mxnet/datasets/kinetics400/kinetics400_train_list_rawframes.txt'),
                  train=True,
                  test_mode=False,
                  name_pattern='img_%05d.jpg',
+                 video_ext='mp4',
                  is_color=True,
                  modality='rgb',
                  num_segments=1,
+                 num_crop=1,
                  new_length=1,
                  new_step=1,
                  new_width=340,
                  new_height=256,
                  target_width=224,
                  target_height=224,
+                 temporal_jitter=False,
+                 video_loader=False,
+                 use_decord=False,
+                 slowfast=False,
+                 slow_temporal_stride=16,
+                 fast_temporal_stride=2,
+                 data_aug='v1',
+                 lazy_init=False,
                  transform=None):
 
-        super(Kinetics400, self).__init__()
-
-        from ...utils.filesystem import try_import_cv2
-        self.cv2 = try_import_cv2()
-        self.root = root
-        self.setting = setting
-        self.train = train
-        self.test_mode = test_mode
-        self.is_color = is_color
-        self.modality = modality
-        self.num_segments = num_segments
-        self.new_height = new_height
-        self.new_width = new_width
-        self.new_length = new_length
-        self.new_step = new_step
-        self.skip_length = self.new_length * self.new_step
-        self.target_height = target_height
-        self.target_width = target_width
-        self.transform = transform
-        self.name_pattern = name_pattern
-
-        self.classes, self.class_to_idx = self._find_classes(root)
-        self.clips = self._make_dataset(root, setting)
-        if len(self.clips) == 0:
-            raise(RuntimeError("Found 0 video clips in subfolders of: " + root + "\n"
-                               "Check your data directory (opt.data-dir)."))
-
-    def __getitem__(self, index):
-
-        directory, duration, target = self.clips[index]
-        average_duration = int(duration / self.num_segments)
-        offsets = []
-        for seg_id in range(self.num_segments):
-            if self.train and not self.test_mode:
-                # train
-                if average_duration >= self.skip_length:
-                    offset = random.randint(0, average_duration - self.skip_length)
-                    offsets.append(offset + seg_id * average_duration)
-                else:
-                    offsets.append(0)
-            elif not self.train and not self.test_mode:
-                # validation
-                if average_duration >= self.skip_length:
-                    offsets.append(int((average_duration - self.skip_length + 1)/2 + seg_id * average_duration))
-                else:
-                    offsets.append(0)
-            else:
-                # test
-                if average_duration >= self.skip_length:
-                    offsets.append(int((average_duration - self.skip_length + 1)/2 + seg_id * average_duration))
-                else:
-                    offsets.append(0)
-
-        # N x H x W, where N = num_oversample * num_segments * new_length * channel
-        clip_input = self._TSN_RGB(directory, offsets, self.new_height, self.new_width, self.skip_length, self.name_pattern, self.new_step)
-
-        if self.transform is not None:
-            clip_input = self.transform(clip_input)
-
-        if self.new_length > 1 and self.num_segments > 1:
-            clip_input = clip_input.reshape((-1, self.num_segments) + (3, self.new_length, self.target_height, self.target_width))
-            if not self.test_mode:
-                # reshape: N' x C x L x H x W, where N' = num_oversample x num_segments
-                clip_input = clip_input.reshape((-1,) + clip_input.shape[2:])
-            else:
-                # reshape: N' x L x H x W, where N' = num_oversample x num_segments x channel
-                clip_input = clip_input.reshape((-1,) + (self.new_length, self.target_height, self.target_width))
-        elif self.new_length > 1 and self.num_segments == 1:
-            clip_input = clip_input.reshape((3, self.new_length, self.target_height, self.target_width))
-        elif self.num_segments > 1 and self.new_length == 1:
-            if not self.test_mode:
-                clip_input = clip_input.reshape((-1, 3, self.target_height, self.target_width))
-
-        return clip_input, target
-
-    def __len__(self):
-        return len(self.clips)
-
-    def _find_classes(self, directory):
-        classes = [d for d in os.listdir(directory) if os.path.isdir(os.path.join(directory, d))]
-        classes.sort()
-        class_to_idx = {classes[i]: i for i in range(len(classes))}
-        return classes, class_to_idx
-
-    def _make_dataset(self, directory, setting):
-        if not os.path.exists(setting):
-            raise(RuntimeError("Setting file %s doesn't exist. Check opt.train-list and opt.val-list. " % (setting)))
-        clips = []
-        with open(setting) as split_f:
-            data = split_f.readlines()
-            for line in data:
-                line_info = line.split()
-                # line format: video_path, video_duration, video_label
-                if len(line_info) < 3:
-                    raise(RuntimeError('Video input format is not correct, missing one or more element. %s' % line))
-                clip_path = os.path.join(directory, line_info[0])
-                duration = int(line_info[1])
-                target = int(line_info[2])
-                item = (clip_path, duration, target)
-                clips.append(item)
-        return clips
-
-    def _TSN_RGB(self, directory, offsets, new_height, new_width, skip_length, name_pattern, new_step):
-        sampled_list = []
-        for _, offset in enumerate(offsets):
-            for length_id in range(1, skip_length + 1, new_step):
-                frame_path = os.path.join(directory, name_pattern % (length_id + offset))
-                cv_img = self.cv2.imread(frame_path)
-                if cv_img is None:
-                    if length_id == 1:
-                        raise(RuntimeError("Could not load file %s starting at frame %d. Check data path." % (frame_path, offset)))
-                    sampled_list.append(np.zeros((new_height, new_width, 3)))   # pad black frames if this video clip does not have `skip_length` frames
-                    continue
-                if new_width > 0 and new_height > 0:
-                    h, w, _ = cv_img.shape
-                    if h != new_height or w != new_width:
-                        cv_img = self.cv2.resize(cv_img, (new_width, new_height))
-                cv_img = cv_img[:, :, ::-1]
-                sampled_list.append(cv_img)
-        clip_input = np.concatenate(sampled_list, axis=2)
-        return nd.array(clip_input)
+        super(Kinetics400, self).__init__(root, setting, train, test_mode, name_pattern,
+                                          video_ext, is_color, modality, num_segments,
+                                          num_crop, new_length, new_step, new_width, new_height,
+                                          target_width, target_height, temporal_jitter,
+                                          video_loader, use_decord, slowfast, slow_temporal_stride,
+                                          fast_temporal_stride, data_aug, lazy_init, transform)
 
 class Kinetics400Attr(object):
     def __init__(self):

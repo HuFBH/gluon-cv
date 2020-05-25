@@ -4,14 +4,22 @@ import os
 
 # disable autotune
 os.environ['MXNET_CUDNN_AUTOTUNE_DEFAULT'] = '0'
+os.environ['MXNET_GPU_MEM_POOL_TYPE'] = 'Round'
+os.environ['MXNET_GPU_MEM_POOL_ROUND_LINEAR_CUTOFF'] = '26'
+os.environ['MXNET_EXEC_BULK_EXEC_MAX_NODE_TRAIN_FWD'] = '999'
+os.environ['MXNET_EXEC_BULK_EXEC_MAX_NODE_TRAIN_BWD'] = '25'
+os.environ['MXNET_GPU_COPY_NTHREADS'] = '1'
+os.environ['MXNET_OPTIMIZER_AGGREGATION_SIZE'] = '54'
+
 import logging
 import time
 import numpy as np
 import mxnet as mx
 from mxnet import gluon
-from mxnet import autograd
 from mxnet.contrib import amp
 import gluoncv as gcv
+
+gcv.utils.check_version('0.7.0')
 from gluoncv import data as gdata
 from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
@@ -20,9 +28,10 @@ from gluoncv.data.transforms.presets.rcnn import FasterRCNNDefaultTrainTransform
     FasterRCNNDefaultValTransform
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
-from gluoncv.utils.parallel import Parallelizable, Parallel
+from gluoncv.utils.parallel import Parallel
 from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
     RCNNL1LossMetric
+from gluoncv.model_zoo.rcnn.faster_rcnn.data_parallel import ForwardBackwardTask
 
 try:
     import horovod.mxnet as hvd
@@ -33,6 +42,8 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Faster-RCNN networks e2e.')
     parser.add_argument('--network', type=str, default='resnet50_v1b',
+                        choices=['resnet18_v1b', 'resnet50_v1b', 'resnet101_v1d',
+                                 'resnest50', 'resnest101', 'resnest269'],
                         help="Base network name which serves as feature extraction base.")
     parser.add_argument('--dataset', type=str, default='voc',
                         help='Training dataset. Now support voc and coco.')
@@ -40,7 +51,7 @@ def parse_args():
                         default=4, help='Number of data workers, you can use larger '
                                         'number to accelerate data loading, '
                                         'if your CPU and GPUs are powerful.')
-    parser.add_argument('--batch-size', type=int, default=8, help='Training mini-batch size.')
+    parser.add_argument('--batch-size', type=int, default=1, help='Training mini-batch size.')
     parser.add_argument('--gpus', type=str, default='0',
                         help='Training with GPUs, you can specify 1,3 for example.')
     parser.add_argument('--epochs', type=str, default='',
@@ -83,12 +94,20 @@ def parse_args():
                         help='Disable mixup training if enabled in the last N epochs.')
 
     # Norm layer options
-    parser.add_argument('--norm-layer', type=str, default=None,
+    parser.add_argument('--norm-layer', type=str, default=None, choices=[None, 'syncbn'],
                         help='Type of normalization layer to use. '
-                             'If set to None, backbone normalization layer will be fixed,'
-                             ' and no normalization layer will be used. '
-                             'Currently supports \'bn\', and None, default is None.'
+                             'If set to None, backbone normalization layer will be frozen,'
+                             ' and no normalization layer will be used in R-CNN. '
+                             'Currently supports \'syncbn\', and None, default is None.'
                              'Note that if horovod is enabled, sync bn will not work correctly.')
+
+    # Loss options
+    parser.add_argument('--rpn-smoothl1-rho', type=float, default=1. / 9.,
+                        help='RPN box regression transition point from L1 to L2 loss.'
+                             'Set to 0.0 to make the loss simply L1.')
+    parser.add_argument('--rcnn-smoothl1-rho', type=float, default=1.,
+                        help='RCNN box regression transition point from L1 to L2 loss.'
+                             'Set to 0.0 to make the loss simply L1.')
 
     # FPN options
     parser.add_argument('--use-fpn', action='store_true',
@@ -114,6 +133,123 @@ def parse_args():
                         help='KV store options. local, device, nccl, dist_sync, dist_device_sync, '
                              'dist_async are available.')
 
+    # Advanced options. Expert Only!! Currently non-FPN model is not supported!!
+    # Default setting is for MS-COCO.
+    # The following options are only used if --custom-model is enabled
+    subparsers = parser.add_subparsers(dest='custom_model')
+    custom_model_parser = subparsers.add_parser(
+        'custom-model',
+        help='Use custom Faster R-CNN w/ FPN model. This is for expert only!'
+             ' You can modify model internal parameters here. Once enabled, '
+             'custom model options become available.')
+    custom_model_parser.add_argument(
+        '--no-pretrained-base', action='store_true', help='Disable pretrained base network.')
+    custom_model_parser.add_argument(
+        '--num-fpn-filters', type=int, default=256, help='Number of filters in FPN output layers.')
+    custom_model_parser.add_argument(
+        '--num-box-head-conv', type=int, default=4,
+        help='Number of convolution layers to use in box head if '
+             'batch normalization is not frozen.')
+    custom_model_parser.add_argument(
+        '--num-box-head-conv-filters', type=int, default=256,
+        help='Number of filters for convolution layers in box head.'
+             ' Only applicable if batch normalization is not frozen.')
+    custom_model_parser.add_argument(
+        '--num_box_head_dense_filters', type=int, default=1024,
+        help='Number of hidden units for the last fully connected layer in '
+             'box head.')
+    custom_model_parser.add_argument(
+        '--image-short', type=str, default='800',
+        help='Short side of the image. Pass a tuple to enable random scale augmentation.')
+    custom_model_parser.add_argument(
+        '--image-max-size', type=int, default=1333,
+        help='Max size of the longer side of the image.')
+    custom_model_parser.add_argument(
+        '--nms-thresh', type=float, default=0.5,
+        help='Non-maximum suppression threshold for R-CNN. '
+             'You can specify < 0 or > 1 to disable NMS.')
+    custom_model_parser.add_argument(
+        '--nms-topk', type=int, default=-1,
+        help='Apply NMS to top k detection results in R-CNN. '
+             'Set to -1 to disable so that every Detection result is used in NMS.')
+    custom_model_parser.add_argument(
+        '--post-nms', type=int, default=-1,
+        help='Only return top `post_nms` detection results, the rest is discarded.'
+             ' Set to -1 to return all detections.')
+    custom_model_parser.add_argument(
+        '--roi-mode', type=str, default='align', choices=['align', 'pool'],
+        help='ROI pooling mode. Currently support \'pool\' and \'align\'.')
+    custom_model_parser.add_argument(
+        '--roi-size', type=str, default='7,7',
+        help='The output spatial size of ROI layer. eg. ROIAlign, ROIPooling')
+    custom_model_parser.add_argument(
+        '--strides', type=str, default='4,8,16,32,64',
+        help='Feature map stride with respect to original image. '
+             'This is usually the ratio between original image size and '
+             'feature map size. Since the custom model uses FPN, it is a list of ints')
+    custom_model_parser.add_argument(
+        '--clip', type=float, default=4.14,
+        help='Clip bounding box transformation predictions '
+             'to prevent exponentiation from overflowing')
+    custom_model_parser.add_argument(
+        '--rpn-channel', type=int, default=256,
+        help='Number of channels used in RPN convolution layers.')
+    custom_model_parser.add_argument(
+        '--anchor-base-size', type=int, default=16,
+        help='The width(and height) of reference anchor box.')
+    custom_model_parser.add_argument(
+        '--anchor-aspect-ratio', type=str, default='0.5,1,2',
+        help='The aspect ratios of anchor boxes.')
+    custom_model_parser.add_argument(
+        '--anchor-scales', type=str, default='2,4,8,16,32',
+        help='The scales of anchor boxes with respect to base size. '
+             'We use the following form to compute the shapes of anchors: '
+             'anchor_width = base_size * scale * sqrt(1 / ratio)'
+             'anchor_height = base_size * scale * sqrt(ratio)')
+    custom_model_parser.add_argument(
+        '--anchor-alloc-size', type=str, default='384,384',
+        help='Allocate size for the anchor boxes as (H, W). '
+             'We generate enough anchors for large feature map, e.g. 384x384. '
+             'During inference we can have variable input sizes, '
+             'at which time we can crop corresponding anchors from this large '
+             'anchor map so we can skip re-generating anchors for each input. ')
+    custom_model_parser.add_argument(
+        '--rpn-nms-thresh', type=float, default='0.7',
+        help='Non-maximum suppression threshold for RPN.')
+    custom_model_parser.add_argument(
+        '--rpn-train-pre-nms', type=int, default=12000,
+        help='Filter top proposals before NMS in RPN training.')
+    custom_model_parser.add_argument(
+        '--rpn-train-post-nms', type=int, default=2000,
+        help='Return top proposal results after NMS in RPN training. '
+             'Will be set to rpn_train_pre_nms if it is larger than '
+             'rpn_train_pre_nms.')
+    custom_model_parser.add_argument(
+        '--rpn-test-pre-nms', type=int, default=6000,
+        help='Filter top proposals before NMS in RPN testing.')
+    custom_model_parser.add_argument(
+        '--rpn-test-post-nms', type=int, default=1000,
+        help='Return top proposal results after NMS in RPN testing. '
+             'Will be set to rpn_test_pre_nms if it is larger than rpn_test_pre_nms.')
+    custom_model_parser.add_argument(
+        '--rpn-min-size', type=int, default=1,
+        help='Proposals whose size is smaller than ``min_size`` will be discarded.')
+    custom_model_parser.add_argument(
+        '--rcnn-num-samples', type=int, default=512, help='Number of samples for RCNN training.')
+    custom_model_parser.add_argument(
+        '--rcnn-pos-iou-thresh', type=float, default=0.5,
+        help='Proposal whose IOU larger than ``pos_iou_thresh`` is '
+             'regarded as positive samples for R-CNN.')
+    custom_model_parser.add_argument(
+        '--rcnn-pos-ratio', type=float, default=0.25,
+        help='``pos_ratio`` defines how many positive samples '
+             '(``pos_ratio * num_sample``) is to be sampled for R-CNN.')
+    custom_model_parser.add_argument(
+        '--max-num-gt', type=int, default=100,
+        help='Maximum ground-truth number for each example. This is only an upper bound, not'
+             'necessarily very precise. However, using a very big number may impact the '
+             'training speed.')
+
     args = parser.parse_args()
 
     if args.horovod:
@@ -130,9 +266,31 @@ def parse_args():
     elif args.dataset == 'coco':
         args.epochs = int(args.epochs) if args.epochs else 26
         args.lr_decay_epoch = args.lr_decay_epoch if args.lr_decay_epoch else '17,23'
-        args.lr = float(args.lr) if args.lr else 0.01
+        args.lr = float(args.lr) if args.lr else 0.00125
         args.lr_warmup = args.lr_warmup if args.lr_warmup else 1000
         args.wd = float(args.wd) if args.wd else 1e-4
+
+    def str_args2num_args(arguments, args_name, num_type):
+        try:
+            ret = [num_type(x) for x in arguments.split(',')]
+            if len(ret) == 1:
+                return ret[0]
+            return ret
+        except ValueError:
+            raise ValueError('invalid value for', args_name, arguments)
+
+    if args.custom_model:
+        args.image_short = str_args2num_args(args.image_short, '--image-short', int)
+        args.roi_size = str_args2num_args(args.roi_size, '--roi-size', int)
+        args.strides = str_args2num_args(args.strides, '--strides', int)
+        args.anchor_aspect_ratio = str_args2num_args(args.anchor_aspect_ratio,
+                                                     '--anchor-aspect-ratio', float)
+        args.anchor_scales = str_args2num_args(args.anchor_scales, '--anchor-scales', float)
+        args.anchor_alloc_size = str_args2num_args(args.anchor_alloc_size,
+                                                   '--anchor-alloc-size', int)
+    if args.amp and args.norm_layer == 'syncbn':
+        raise NotImplementedError('SyncBatchNorm currently does not support AMP.')
+
     return args
 
 
@@ -142,6 +300,13 @@ def get_dataset(dataset, args):
             splits=[(2007, 'trainval'), (2012, 'trainval')])
         val_dataset = gdata.VOCDetection(
             splits=[(2007, 'test')])
+        val_metric = VOC07MApMetric(iou_thresh=0.5, class_names=val_dataset.classes)
+    elif dataset.lower() in ['clipart', 'comic', 'watercolor']:
+        root = os.path.join('~', '.mxnet', 'datasets', dataset.lower())
+        train_dataset = gdata.CustomVOCDetection(root=root, splits=[('', 'train')],
+                                                 generate_classes=True)
+        val_dataset = gdata.CustomVOCDetection(root=root, splits=[('', 'test')],
+                                               generate_classes=True)
         val_metric = VOC07MApMetric(iou_thresh=0.5, class_names=val_dataset.classes)
     elif dataset.lower() == 'coco':
         train_dataset = gdata.COCODetection(splits='instances_train2017', use_crowd=False)
@@ -159,9 +324,12 @@ def get_dataloader(net, train_dataset, val_dataset, train_transform, val_transfo
                    num_shards, args):
     """Get dataloader."""
     train_bfn = FasterRCNNTrainBatchify(net, num_shards)
+    if hasattr(train_dataset, 'get_im_aspect_ratio'):
+        im_aspect_ratio = train_dataset.get_im_aspect_ratio()
+    else:
+        im_aspect_ratio = [1.] * len(train_dataset)
     train_sampler = \
-        gcv.nn.sampler.SplitSortedBucketSampler(train_dataset.get_im_aspect_ratio(),
-                                                batch_size,
+        gcv.nn.sampler.SplitSortedBucketSampler(im_aspect_ratio, batch_size,
                                                 num_parts=hvd.size() if args.horovod else 1,
                                                 part_index=hvd.rank() if args.horovod else 0,
                                                 shuffle=True)
@@ -247,74 +415,15 @@ def get_lr_at_iter(alpha, lr_warmup_factor=1. / 3.):
     return lr_warmup_factor * (1 - alpha) + alpha
 
 
-class ForwardBackwardTask(Parallelizable):
-    def __init__(self, net, optimizer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss,
-                 mix_ratio):
-        super(ForwardBackwardTask, self).__init__()
-        self.net = net
-        self._optimizer = optimizer
-        self.rpn_cls_loss = rpn_cls_loss
-        self.rpn_box_loss = rpn_box_loss
-        self.rcnn_cls_loss = rcnn_cls_loss
-        self.rcnn_box_loss = rcnn_box_loss
-        self.mix_ratio = mix_ratio
-
-    def forward_backward(self, x):
-        data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
-        with autograd.record():
-            gt_label = label[:, :, 4:5]
-            gt_box = label[:, :, :4]
-            cls_pred, box_pred, roi, samples, matches, rpn_score, rpn_box, anchors = net(
-                data, gt_box)
-            # losses of rpn
-            rpn_score = rpn_score.squeeze(axis=-1)
-            num_rpn_pos = (rpn_cls_targets >= 0).sum()
-            rpn_loss1 = self.rpn_cls_loss(rpn_score, rpn_cls_targets,
-                                          rpn_cls_targets >= 0) * rpn_cls_targets.size / num_rpn_pos
-            rpn_loss2 = self.rpn_box_loss(rpn_box, rpn_box_targets,
-                                          rpn_box_masks) * rpn_box.size / num_rpn_pos
-            # rpn overall loss, use sum rather than average
-            rpn_loss = rpn_loss1 + rpn_loss2
-            # generate targets for rcnn
-            cls_targets, box_targets, box_masks = self.net.target_generator(roi, samples,
-                                                                            matches, gt_label,
-                                                                            gt_box)
-            # losses of rcnn
-            num_rcnn_pos = (cls_targets >= 0).sum()
-            rcnn_loss1 = self.rcnn_cls_loss(cls_pred, cls_targets,
-                                            cls_targets.expand_dims(-1) >= 0) * cls_targets.size / \
-                         num_rcnn_pos
-            rcnn_loss2 = self.rcnn_box_loss(box_pred, box_targets, box_masks) * box_pred.size / \
-                         num_rcnn_pos
-            rcnn_loss = rcnn_loss1 + rcnn_loss2
-            # overall losses
-            total_loss = rpn_loss.sum() * self.mix_ratio + rcnn_loss.sum() * self.mix_ratio
-
-            rpn_loss1_metric = rpn_loss1.mean() * self.mix_ratio
-            rpn_loss2_metric = rpn_loss2.mean() * self.mix_ratio
-            rcnn_loss1_metric = rcnn_loss1.mean() * self.mix_ratio
-            rcnn_loss2_metric = rcnn_loss2.mean() * self.mix_ratio
-            rpn_acc_metric = [[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]]
-            rpn_l1_loss_metric = [[rpn_box_targets, rpn_box_masks], [rpn_box]]
-            rcnn_acc_metric = [[cls_targets], [cls_pred]]
-            rcnn_l1_loss_metric = [[box_targets, box_masks], [box_pred]]
-
-            if args.amp:
-                with amp.scale_loss(total_loss, self._optimizer) as scaled_losses:
-                    autograd.backward(scaled_losses)
-            else:
-                total_loss.backward()
-
-        return rpn_loss1_metric, rpn_loss2_metric, rcnn_loss1_metric, rcnn_loss2_metric, \
-               rpn_acc_metric, rpn_l1_loss_metric, rcnn_acc_metric, rcnn_l1_loss_metric
-
-
 def train(net, train_data, val_data, eval_metric, batch_size, ctx, args):
     """Training pipeline"""
+    args.kv_store = 'device' if (args.amp and 'nccl' in args.kv_store) else args.kv_store
     kv = mx.kvstore.create(args.kv_store)
     net.collect_params().setattr('grad_req', 'null')
     net.collect_train_params().setattr('grad_req', 'write')
     optimizer_params = {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum}
+    if args.amp:
+        optimizer_params['multi_precision'] = True
     if args.horovod:
         hvd.broadcast_parameters(net.collect_params(), root_rank=0)
         trainer = hvd.DistributedTrainer(
@@ -338,9 +447,9 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, args):
 
     # TODO(zhreshold) losses?
     rpn_cls_loss = mx.gluon.loss.SigmoidBinaryCrossEntropyLoss(from_sigmoid=False)
-    rpn_box_loss = mx.gluon.loss.HuberLoss(rho=1 / 9.)  # == smoothl1
+    rpn_box_loss = mx.gluon.loss.HuberLoss(rho=args.rpn_smoothl1_rho)  # == smoothl1
     rcnn_cls_loss = mx.gluon.loss.SoftmaxCrossEntropyLoss()
-    rcnn_box_loss = mx.gluon.loss.HuberLoss()  # == smoothl1
+    rcnn_box_loss = mx.gluon.loss.HuberLoss(rho=args.rcnn_smoothl1_rho)  # == smoothl1
     metrics = [mx.metric.Loss('RPN_Conf'),
                mx.metric.Loss('RPN_SmoothL1'),
                mx.metric.Loss('RCNN_CrossEntropy'),
@@ -362,19 +471,23 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, args):
         os.makedirs(log_dir)
     fh = logging.FileHandler(log_file_path)
     logger.addHandler(fh)
+    if args.custom_model:
+        logger.info('Custom model enabled. Expert Only!! Currently non-FPN model is not supported!!'
+                    ' Default setting is for MS-COCO.')
     logger.info(args)
+
     if args.verbose:
         logger.info('Trainable parameters:')
         logger.info(net.collect_train_params().keys())
     logger.info('Start training from [Epoch {}]'.format(args.start_epoch))
     best_map = [0]
     for epoch in range(args.start_epoch, args.epochs):
+        rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss,
+                                        rcnn_box_loss, mix_ratio=1.0, amp_enabled=args.amp)
+        executor = Parallel(args.executor_threads, rcnn_task) if not args.horovod else None
         mix_ratio = 1.0
         if not args.disable_hybridization:
             net.hybridize(static_alloc=args.static_alloc)
-        rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss,
-                                        rcnn_box_loss, mix_ratio=1.0)
-        executor = Parallel(args.executor_threads, rcnn_task) if not args.horovod else None
         if args.mixup:
             # TODO(zhreshold) only support evenly mixup now, target generator needs to be modified otherwise
             train_data._dataset._data.set_mixup(np.random.uniform, 0.5, 0.5)
@@ -448,7 +561,6 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, args):
                 current_map = 0.
             save_params(net, logger, best_map, current_map, epoch, args.save_interval,
                         args.save_prefix)
-        executor.__del__()
 
 
 if __name__ == '__main__':
@@ -469,6 +581,9 @@ if __name__ == '__main__':
         ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
         ctx = ctx if ctx else [mx.cpu()]
 
+    # training data
+    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
+
     # network
     kwargs = {}
     module_list = []
@@ -476,12 +591,56 @@ if __name__ == '__main__':
         module_list.append('fpn')
     if args.norm_layer is not None:
         module_list.append(args.norm_layer)
-        if args.norm_layer == 'bn':
-            kwargs['num_devices'] = len(args.gpus.split(','))
+        if args.norm_layer == 'syncbn':
+            kwargs['num_devices'] = len(ctx)
+
+    num_gpus = hvd.size() if args.horovod else len(ctx)
     net_name = '_'.join(('faster_rcnn', *module_list, args.network, args.dataset))
+    if args.custom_model:
+        args.use_fpn = True
+        net_name = '_'.join(('custom_faster_rcnn_fpn', args.network, args.dataset))
+        if args.norm_layer == 'syncbn':
+            norm_layer = gluon.contrib.nn.SyncBatchNorm
+            norm_kwargs = {'num_devices': len(ctx)}
+            sym_norm_layer = mx.sym.contrib.SyncBatchNorm
+            sym_norm_kwargs = {'ndev': len(ctx)}
+        elif args.norm_layer == 'gn':
+            norm_layer = gluon.nn.GroupNorm
+            norm_kwargs = {'groups': 8}
+            sym_norm_layer = mx.sym.GroupNorm
+            sym_norm_kwargs = {'groups': 8}
+        else:
+            norm_layer = gluon.nn.BatchNorm
+            norm_kwargs = None
+            sym_norm_layer = None
+            sym_norm_kwargs = None
+        classes = train_dataset.CLASSES
+        net = get_model('custom_faster_rcnn_fpn', classes=classes, transfer=None,
+                        dataset=args.dataset, pretrained_base=not args.no_pretrained_base,
+                        base_network_name=args.network, norm_layer=norm_layer,
+                        norm_kwargs=norm_kwargs, sym_norm_kwargs=sym_norm_kwargs,
+                        num_fpn_filters=args.num_fpn_filters,
+                        num_box_head_conv=args.num_box_head_conv,
+                        num_box_head_conv_filters=args.num_box_head_conv_filters,
+                        num_box_head_dense_filters=args.num_box_head_dense_filters,
+                        short=args.image_short, max_size=args.image_max_size, min_stage=2,
+                        max_stage=6, nms_thresh=args.nms_thresh, nms_topk=args.nms_topk,
+                        post_nms=args.post_nms, roi_mode=args.roi_mode, roi_size=args.roi_size,
+                        strides=args.strides, clip=args.clip, rpn_channel=args.rpn_channel,
+                        base_size=args.anchor_base_size, scales=args.anchor_scales,
+                        ratios=args.anchor_aspect_ratio, alloc_size=args.anchor_alloc_size,
+                        rpn_nms_thresh=args.rpn_nms_thresh,
+                        rpn_train_pre_nms=args.rpn_train_pre_nms,
+                        rpn_train_post_nms=args.rpn_train_post_nms,
+                        rpn_test_pre_nms=args.rpn_test_pre_nms,
+                        rpn_test_post_nms=args.rpn_test_post_nms, rpn_min_size=args.rpn_min_size,
+                        per_device_batch_size=args.batch_size // num_gpus,
+                        num_sample=args.rcnn_num_samples, pos_iou_thresh=args.rcnn_pos_iou_thresh,
+                        pos_ratio=args.rcnn_pos_ratio, max_num_gt=args.max_num_gt)
+    else:
+        net = get_model(net_name, pretrained_base=True,
+                        per_device_batch_size=args.batch_size // num_gpus, **kwargs)
     args.save_prefix += net_name
-    net = get_model(net_name, pretrained_base=True,
-                    per_device_batch_size=args.batch_size // len(ctx), **kwargs)
     if args.resume.strip():
         net.load_parameters(args.resume.strip())
     else:
@@ -491,9 +650,15 @@ if __name__ == '__main__':
             param.initialize()
     net.collect_params().reset_ctx(ctx)
 
-    # training data
-    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
-    batch_size = args.batch_size // len(ctx) if args.horovod else args.batch_size
+    if args.amp:
+        # Cast both weights and gradients to 'float16'
+        net.cast('float16')
+        # These layers don't support type 'float16'
+        net.collect_params('.*batchnorm.*').setattr('dtype', 'float32')
+        net.collect_params('.*normalizedperclassboxcenterencoder.*').setattr('dtype', 'float32')
+
+    # dataloader
+    batch_size = args.batch_size // num_gpus if args.horovod else args.batch_size
     train_data, val_data = get_dataloader(
         net, train_dataset, val_dataset, FasterRCNNDefaultTrainTransform,
         FasterRCNNDefaultValTransform, batch_size, len(ctx), args)

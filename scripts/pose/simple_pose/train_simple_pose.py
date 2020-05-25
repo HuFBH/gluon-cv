@@ -9,6 +9,8 @@ from mxnet import autograd as ag
 from mxnet.gluon import nn
 from mxnet.gluon.data.vision import transforms
 
+import gluoncv as gcv
+gcv.utils.check_version('0.6.0')
 from gluoncv.data import mscoco
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs, LRScheduler, LRSequential
@@ -173,8 +175,11 @@ def train(ctx):
     if isinstance(ctx, mx.Context):
         ctx = [ctx]
     if opt.use_pretrained_base:
-        net.deconv_layers.initialize(ctx=ctx)
-        net.final_layer.initialize(ctx=ctx)
+        if model_name.startswith('simple'):
+            net.deconv_layers.initialize(ctx=ctx)
+            net.final_layer.initialize(ctx=ctx)
+        elif model_name.startswith('mobile'):
+            net.upsampling.initialize(ctx=ctx)
     else:
         net.initialize(mx.init.MSRAPrelu(), ctx=ctx)
 

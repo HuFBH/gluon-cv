@@ -10,7 +10,8 @@ Visualization of Inference Throughputs vs. Validation Accuracy of ImageNet pre-t
 .. image:: /_static/plot_help.png
   :width: 100%
 
-.. include:: /_static/classification_throughputs.html
+.. raw:: html
+   :file: ../_static/classification_throughputs.html
 
 How To Use Pretrained Models
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -158,6 +159,7 @@ ResNet
    | ResNet152_v2 [2]_         | 79.21  | 94.31  | f2695542 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnet152_v2.sh>`_        | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnet152_v2.log>`_         |
    +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
 
+
 ResNext
 -------
 
@@ -179,6 +181,29 @@ ResNext
    +---------------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
    | SE_ResNext101_64x4d [12]_ [14]_ | 81.01  | 95.32  | 11c50114 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/se_resnext101_64x4d.sh>`_ | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/se_resnext101_64x4d.log>`_  |
    +---------------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+
+ResNeSt
+-------
+
+.. table::
+   :widths: 45 5 5 10 20 15
+
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | Model                     | Top-1  | Top-5  | Hashtag  | Training Command                                                                                                                     | Training Log                                                                                                                  |
+   +===========================+========+========+==========+======================================================================================================================================+===============================================================================================================================+
+   | ResNeSt14 [17]_           | 75.75  | 92.70  | 7e0b0cae | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest14.sh>`_           | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest14.log>`_            |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | ResNeSt26 [17]_           | 78.68  | 94.38  | 36459074 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest26.sh>`_           |                                                                                                                               |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | ResNeSt50 [17]_           | 81.04  | 95.42  | bcfefe1d | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest50.sh>`_           | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest50.log>`_            |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | ResNeSt101 [17]_          | 82.83  | 96.42  | 5da943b3 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest101.sh>`_          | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest101.log>`_           |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | ResNeSt200 [17]_          | 83.86  | 96.86  | 0c5d117d | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest200.sh>`_          | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest200.log>`_           |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | ResNeSt269 [17]_          | 84.53  | 96.98  | 11ae7f5d | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest269.sh>`_          | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/resnest269.log>`_           |
+   +---------------------------+--------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+
 
 MobileNet
 ---------
@@ -322,6 +347,8 @@ Others
    +-------------------------+--------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
    | InceptionV3 [8]_        | 78.77  | 94.39  | a5050dbc | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/inceptionv3-mixup.sh>`_ | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/inceptionv3-mixup.log>`_    |
    +-------------------------+--------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
+   | GoogLeNet [16]_         | 72.87  | 91.17  | c7c89366 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/googlenet-mixup.sh>`_   | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/googlenet-mixup.log>`_      |
+   +-------------------------+--------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
    | Xception [8]_           | 79.56  | 94.77  | 37c1c90b | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/train_xception.sh>`_    |  `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/xception.log>`_            |
    +-------------------------+--------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------+
    | :tag:`InceptionV3` [8]_ | 78.41  | 94.13  | e132adf2 | `shell script <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/inceptionv3.sh>`_       | `log <https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/logs/classification/imagenet/inceptionv3.log>`_          |
@@ -414,3 +441,9 @@ The following table lists pre-trained models trained on CIFAR10.
 .. [15] Howard, Andrew, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang et al. \
        "Searching for mobilenetv3." \
        arXiv preprint arXiv:1905.02244 (2019).
+.. [16] Christian Szegedy, Wei Liu, Yangqing Jia, Pierre Sermanet, Scott Reed, Dragomir Anguelov, Dumitru Erhan, Vincent Vanhoucke, Andrew Rabinovich \
+        "Going Deeper with Convolutions" \
+        arXiv preprint arXiv:1409.4842 (2014).
+.. [17] Hang Zhang, Chongruo Wu, Zhongyue Zhang, Yi Zhu, Zhi Zhang, Haibin Lin, Yue Sun, Tong He, Jonas Muller, R. Manmatha, Mu Li and Alex Smola \
+        "ResNeSt: Split-Attention Network" \
+        arXiv preprint (2020).

@@ -146,7 +146,7 @@ class COCODetection(VisionDataset):
         img = mx.image.imread(img_path, 1)
         if self._transform is not None:
             return self._transform(img, label)
-        return img, np.array(label)
+        return img, np.array(label).copy()
 
     def _load_jsons(self):
         """Load all image paths and labels from JSON annotation files into buffer."""
@@ -233,9 +233,11 @@ class COCODetectionDALI(object):
         Directory containing the COCO dataset.
     annotations_file
         The COCO annotation file to read from.
+    device_id: int
+         GPU device used for the DALI pipeline.
     """
 
-    def __init__(self, num_shards, shard_id, file_root, annotations_file):
+    def __init__(self, num_shards, shard_id, file_root, annotations_file, device_id):
         self.input = dali.ops.COCOReader(
             file_root=file_root,
             annotations_file=annotations_file,
@@ -246,7 +248,7 @@ class COCODetectionDALI(object):
             ltrb=True,
             shuffle_after_epoch=True)
 
-        self.decode = dali.ops.HostDecoder(device="cpu", output_type=dali.types.RGB)
+        self.decode = dali.ops.ImageDecoder(device="cpu", output_type=dali.types.RGB)
 
         # We need to build the COCOReader ops to parse the annotations
         # and have acces to the dataset size.
@@ -256,9 +258,9 @@ class COCODetectionDALI(object):
             and get the epoch size. To be replaced by DALI standalone op, when available.
             """
 
-            def __init__(self):
+            def __init__(self, device_id):
                 super(DummyMicroPipe, self).__init__(batch_size=1,
-                                                     device_id=0,
+                                                     device_id=device_id,
                                                      num_threads=1)
                 self.input = dali.ops.COCOReader(
                     file_root=file_root,
@@ -268,7 +270,7 @@ class COCODetectionDALI(object):
                 inputs, bboxes, labels = self.input(name="Reader")
                 return (inputs, bboxes, labels)
 
-        micro_pipe = DummyMicroPipe()
+        micro_pipe = DummyMicroPipe(device_id=device_id)
         micro_pipe.build()
         self._size = micro_pipe.epoch_size(name="Reader")
         del micro_pipe

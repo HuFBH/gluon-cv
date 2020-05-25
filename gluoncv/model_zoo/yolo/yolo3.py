@@ -26,8 +26,7 @@ __all__ = ['YOLOV3',
            'yolo3_mobilenet1_0_custom',
            'yolo3_mobilenet0_25_coco',
            'yolo3_mobilenet0_25_voc',
-           'yolo3_mobilenet0_25_custom'
-           ]
+           'yolo3_mobilenet0_25_custom']
 
 def _upsample(x, stride=2):
     """Simple upsampling layer by stack pixel alongside horizontal and vertical directions.
@@ -346,6 +345,9 @@ class YOLOV3(gluon.HybridBlock):
             with format (cid, score, xmin, ymin, xmax, ymax)
             During training, return losses only: (obj_loss, center_loss, scale_loss, cls_loss).
         """
+        if len(args) != 0 and not autograd.is_training():
+            raise TypeError('YOLOV3 inference only need one input data.')
+
         all_box_centers = []
         all_box_scales = []
         all_objectness = []
@@ -955,5 +957,5 @@ def yolo3_mobilenet0_25_coco(pretrained_base=True, pretrained=False, norm_layer=
     strides = [8, 16, 32]
     classes = COCODetection.CLASSES
     return get_yolov3(
-        'mobilenet1.0', stages, [256, 128, 128], anchors, strides, classes, 'coco',
+        'mobilenet0.25', stages, [256, 128, 128], anchors, strides, classes, 'coco',
         pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
